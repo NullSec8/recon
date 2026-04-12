@@ -1,11 +1,14 @@
-# Recon Tool
+# Recon Framework
 
-This repository contains a Python recon helper script (`main.py`).
+Production-grade modular recon orchestrator CLI.
 
-## Usage
+## Quick Start
 
 ```bash
-python3 main.py --help
+python3 main.py --list-modules
+python3 main.py example.com --profile quick --json-out report.json --md-out report.md
 ```
 
-Run only against targets you own or are explicitly authorized to test.
+## Safety
+
+Run this tool only against targets you own or where you have explicit written authorization.

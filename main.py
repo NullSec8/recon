@@ -1,367 +1,316 @@
 #!/usr/bin/env python3
-"""Powerful recon orchestrator for Kali/Linux tools.
+"""Production-grade modular recon orchestrator.
 
-Supported modules:
-- whois
-- nslookup
-- dig
-- nmap
-- lynx (HTTP content dump)
-- dir enumeration (dirbuster/feroxbuster/dirsearch/gobuster)
-
-Use only on assets you own or have explicit written authorization to test.
+Use only on systems you own or have explicit written authorization to assess.
 """
 
 from __future__ import annotations
 
 import argparse
-import json
-import shutil
-import subprocess
+import logging
+import os
 import sys
-import textwrap
-from concurrent.futures import ThreadPoolExecutor, as_completed
-from dataclasses import asdict, dataclass
-from datetime import datetime, timezone
 from pathlib import Path
-from typing import Iterable, List, Sequence
+from typing import Sequence
+
+from recon.context import RunContext
+from recon.errors import ErrorType
+from recon.executor import TaskExecutor
+from recon.pipeline import build_initial_tasks, extend_tasks_from_pipeline
+from recon.plugin_loader import discover_plugins
+from recon.reporting import (
+    build_json_payload,
+    build_markdown_report,
+    print_console_summary,
+    write_json_report,
+    write_markdown_report,
+)
+from recon.targeting import analyze_target
+from recon.utils import normalize_argv
+
+LOG = logging.getLogger("recon")
+PLUGIN_DIRECTORY = Path(__file__).with_name("plugins")
+DEFAULT_NMAP_ARGS = ["-sV", "-Pn"]
+SAFE_MAX_JOBS = 8
 
 
-@dataclass
-class ToolResult:
-    name: str
-    target: str
-    command: List[str]
-    returncode: int
-    output: str
-    duration_seconds: float
+def setup_logging(debug: bool) -> None:
+    """Configure logging output and verbosity."""
+    level = logging.DEBUG if debug else logging.INFO
+    logging.basicConfig(
+        level=level,
+        format="%(asctime)s | %(levelname)-7s | %(name)s | %(message)s",
+    )
 
 
-def command_exists(command: str) -> bool:
-    return shutil.which(command) is not None
+def parse_list_arg(value: str | None) -> set[str]:
+    """Parse comma-separated module lists."""
+    if not value:
+        return set()
+    return {item.strip() for item in value.split(",") if item.strip()}
 
 
-def normalize_argv(argv: Sequence[str]) -> List[str]:
-    """Accept common single-dash long options such as `-all` by normalizing to `--all`."""
-    normalized: List[str] = []
-    for arg in argv:
-        if arg.startswith("-") and not arg.startswith("--") and len(arg) > 2 and not arg[1].isdigit():
-            normalized.append(f"--{arg[1:]}")
-        else:
-            normalized.append(arg)
-    return normalized
+def _detect_default_jobs() -> int:
+    """Choose a conservative default worker count from CPU count."""
+    count = os.cpu_count() or 2
+    return max(1, min(4, count))
 
 
-def run_command(name: str, target: str, command: List[str], timeout: int) -> ToolResult:
-    start = datetime.now(timezone.utc)
-    try:
-        completed = subprocess.run(
-            command,
-            capture_output=True,
-            text=True,
-            timeout=timeout,
-            check=False,
-        )
-        output = (completed.stdout or "") + ("\n" + completed.stderr if completed.stderr else "")
-        end = datetime.now(timezone.utc)
-        return ToolResult(
-            name=name,
-            target=target,
-            command=command,
-            returncode=completed.returncode,
-            output=output.strip() or "(no output)",
-            duration_seconds=(end - start).total_seconds(),
-        )
-    except subprocess.TimeoutExpired:
-        end = datetime.now(timezone.utc)
-        return ToolResult(
-            name=name,
-            target=target,
-            command=command,
-            returncode=124,
-            output=f"Command timed out after {timeout}s",
-            duration_seconds=(end - start).total_seconds(),
-        )
-    except Exception as exc:  # defensive fallback
-        end = datetime.now(timezone.utc)
-        return ToolResult(
-            name=name,
-            target=target,
-            command=command,
-            returncode=1,
-            output=f"Failed to run command: {exc}",
-            duration_seconds=(end - start).total_seconds(),
-        )
+def parse_args(argv: Sequence[str]) -> argparse.Namespace:
+    """Parse command-line arguments with grouped UX."""
+    parser = argparse.ArgumentParser(
+        description="Modular recon framework with plugin execution pipeline.",
+    )
+
+    target_group = parser.add_argument_group("Target Selection")
+    target_group.add_argument("target", nargs="?", help="Single target (domain, IP, or URL)")
+    target_group.add_argument("--targets-file", help="File containing targets, one per line")
+    target_group.add_argument("--url", help="Override URL for web-centric modules")
+
+    module_group = parser.add_argument_group("Module Controls")
+    module_group.add_argument("--all", action="store_true", help="Enable all discovered modules")
+    module_group.add_argument("--profile", choices=["quick", "web", "full"], help="Apply module presets")
+    module_group.add_argument("--enable", help="Comma-separated modules to enable")
+    module_group.add_argument("--disable", help="Comma-separated modules to disable")
+    module_group.add_argument("--list-modules", action="store_true", help="List discovered modules and exit")
+
+    perf_group = parser.add_argument_group("Performance & Safety")
+    perf_group.add_argument("--timeout", type=int, default=120, help="Per command timeout in seconds")
+    perf_group.add_argument("--jobs", type=int, default=_detect_default_jobs(), help="Concurrent task workers")
+    perf_group.add_argument(
+        "--max-jobs",
+        type=int,
+        default=SAFE_MAX_JOBS,
+        help=f"Safety cap for workers (default: {SAFE_MAX_JOBS})",
+    )
+    perf_group.add_argument(
+        "--rate-limit",
+        type=float,
+        default=0.0,
+        help="Maximum command starts per second (0 disables).",
+    )
+    perf_group.add_argument(
+        "--task-delay",
+        type=float,
+        default=0.0,
+        help="Delay in seconds before each command starts.",
+    )
+    perf_group.add_argument("--dry-run", action="store_true", help="Print planned tasks without executing")
+
+    plugin_arg_group = parser.add_argument_group("Plugin Arguments")
+    plugin_arg_group.add_argument("--nmap-args", nargs="*", default=DEFAULT_NMAP_ARGS, help="Extra nmap args")
+    plugin_arg_group.add_argument("--nmap-scripts", help="Nmap script categories, e.g. default,vuln")
+    plugin_arg_group.add_argument("--top-ports", type=int, help="Nmap top ports")
+    plugin_arg_group.add_argument(
+        "--dir-enum-args",
+        nargs="*",
+        default=[],
+        help="Additional args for selected directory enumeration backend",
+    )
+    plugin_arg_group.add_argument("--wordlist", help="Wordlist path for dir enumeration")
+    plugin_arg_group.add_argument(
+        "--dig-record-type",
+        default="A",
+        help="Record type for dig (A, AAAA, CNAME, etc). Default: A",
+    )
+    plugin_arg_group.add_argument(
+        "--parse-structured",
+        action="store_true",
+        default=True,
+        help="Enable structured parsing for supported modules (default enabled)",
+    )
+
+    output_group = parser.add_argument_group("Output")
+    output_group.add_argument("--json-out", help="Write structured JSON output to file")
+    output_group.add_argument("--md-out", help="Write markdown report to file")
+    output_group.add_argument("--verbose", action="store_true", help="Print full module outputs")
+    output_group.add_argument("--failures-only", action="store_true", help="Show details only for failures")
+    output_group.add_argument("--debug", action="store_true", help="Enable debug logs")
+
+    args = parser.parse_args(normalize_argv(list(argv)))
+    args.enable_set = parse_list_arg(args.enable)
+    args.disable_set = parse_list_arg(args.disable)
+    return args
 
 
-def print_result(result: ToolResult) -> None:
-    status = "OK" if result.returncode == 0 else f"EXIT {result.returncode}"
-    cmd = " ".join(result.command)
-    print(f"  - [{result.target}] {result.name:<12} {status:<9} {result.duration_seconds:>6.2f}s | {cmd}")
-
-
-def format_output_snippet(output: str, max_lines: int = 12, max_width: int = 120) -> str:
-    lines = output.splitlines()
-    clipped = lines[:max_lines]
-    if len(lines) > max_lines:
-        clipped.append(f"... ({len(lines) - max_lines} more lines)")
-    cleaned = [textwrap.shorten(line, width=max_width, placeholder=" ...") for line in clipped]
-    return "\n".join(cleaned) if cleaned else "(no output)"
-
-
-def print_result_details(result: ToolResult, verbose: bool) -> None:
-    print(f"\n[{result.target}] {result.name} output:")
-    if verbose:
-        print(result.output)
-    else:
-        print(format_output_snippet(result.output))
-
-
-def pick_dir_enum_command(args: argparse.Namespace, target: str) -> tuple[str, List[str]]:
-    url = args.url if args.url else f"http://{target}"
-
-    if command_exists("feroxbuster"):
-        wordlist = args.wordlist or "/usr/share/wordlists/dirb/common.txt"
-        return "feroxbuster", ["feroxbuster", "-u", url, "-w", wordlist] + args.dir_enum_args
-
-    if command_exists("dirsearch"):
-        wordlist = args.wordlist or "/usr/share/wordlists/dirb/common.txt"
-        return "dirsearch", ["dirsearch", "-u", url, "-w", wordlist] + args.dir_enum_args
-
-    if command_exists("dirbuster"):
-        return "dirbuster", ["dirbuster"] + args.dir_enum_args + [target]
-
-    if command_exists("gobuster"):
-        wordlist = args.wordlist or "/usr/share/wordlists/dirb/common.txt"
-        return "gobuster", ["gobuster", "dir", "-u", url, "-w", wordlist] + args.dir_enum_args
-
-    return "dir-enum", ["echo", "No directory enumeration tool found (feroxbuster/dirsearch/dirbuster/gobuster)."]
-
-
-def build_tasks_for_target(args: argparse.Namespace, target: str) -> Iterable[tuple[str, str, List[str]]]:
-    if args.whois:
-        yield "whois", target, ["whois", target]
-
-    if args.nslookup:
-        yield "nslookup", target, ["nslookup", target]
-
-    if args.dig:
-        yield "dig", target, ["dig", target, "+short"]
-
-    if args.nmap:
-        nmap_cmd = ["nmap"] + args.nmap_args + [target]
-        if args.nmap_scripts:
-            nmap_cmd += ["--script", args.nmap_scripts]
-        if args.top_ports:
-            nmap_cmd += ["--top-ports", str(args.top_ports)]
-        yield "nmap", target, nmap_cmd
-
-    if args.lynx:
-        lynx_url = args.url if args.url else f"http://{target}"
-        yield "lynx", target, ["lynx", "-dump", lynx_url]
-
-    if args.dir_enum:
-        mod_name, cmd = pick_dir_enum_command(args, target)
-        yield mod_name, target, cmd
-
-
-def load_targets(args: argparse.Namespace) -> List[str]:
-    targets: List[str] = []
-
+def _load_targets(args: argparse.Namespace) -> list[str]:
+    """Load and deduplicate targets from positional and file input."""
+    targets: list[str] = []
     if args.target:
-        targets.append(args.target)
-
+        targets.append(args.target.strip())
     if args.targets_file:
         for line in Path(args.targets_file).read_text(encoding="utf-8").splitlines():
             line = line.strip()
             if line and not line.startswith("#"):
                 targets.append(line)
-
-    deduped = []
-    seen = set()
-    for item in targets:
-        if item not in seen:
-            seen.add(item)
-            deduped.append(item)
-
+    deduped: list[str] = []
+    seen: set[str] = set()
+    for target in targets:
+        if target and target not in seen:
+            seen.add(target)
+            deduped.append(target)
     if not deduped:
-        raise ValueError("No targets supplied. Provide target positional arg and/or --targets-file.")
-
+        raise ValueError("No targets supplied. Provide positional target and/or --targets-file.")
     return deduped
 
 
-def apply_profile(args: argparse.Namespace) -> None:
-    if args.profile == "quick":
-        args.nslookup = True
-        args.dig = True
-        args.nmap = True
-        if args.nmap_args == ["-sV", "-Pn"]:
-            args.nmap_args = ["-sV", "-Pn", "-T4"]
-        if args.top_ports is None:
-            args.top_ports = 100
-    elif args.profile == "web":
-        args.whois = True
-        args.nslookup = True
-        args.lynx = True
-        args.dir_enum = True
-    elif args.profile == "full":
-        args.whois = args.nslookup = args.dig = args.nmap = args.lynx = args.dir_enum = True
-        if args.top_ports is None:
-            args.top_ports = 1000
+def _profile_modules(profile: str | None) -> set[str]:
+    """Map profile names to module sets."""
+    if profile == "quick":
+        return {"nslookup", "dig", "nmap"}
+    if profile == "web":
+        return {"whois", "nslookup", "lynx", "dir-enum"}
+    if profile == "full":
+        return {"whois", "nslookup", "dig", "nmap", "lynx", "dir-enum"}
+    return set()
 
 
-def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(
-        description="Powerful Kali/Linux recon helper. Run one or many recon modules across targets."
-    )
-    parser.add_argument("target", nargs="?", help="Domain/IP target (example.com or 10.10.10.10)")
-    parser.add_argument("--targets-file", help="File with targets, one per line")
-    parser.add_argument(
-        "--url",
-        help="Optional full URL for web modules (lynx/dir enum), e.g. https://example.com",
-    )
-    parser.add_argument("--timeout", type=int, default=120, help="Timeout seconds per command")
-    parser.add_argument("--jobs", type=int, default=2, help="Concurrent jobs (default: 2)")
-
-    parser.add_argument("--whois", action="store_true", help="Run whois")
-    parser.add_argument("--nslookup", action="store_true", help="Run nslookup")
-    parser.add_argument("--dig", action="store_true", help="Run dig +short")
-    parser.add_argument("--nmap", action="store_true", help="Run nmap")
-    parser.add_argument("--lynx", action="store_true", help="Run lynx -dump")
-    parser.add_argument("--dir-enum", action="store_true", help="Run directory enumeration module")
-    parser.add_argument("--all", action="store_true", help="Enable all modules")
-
-    parser.add_argument(
-        "--profile",
-        choices=["quick", "web", "full"],
-        help="Preset modules and defaults",
-    )
-
-    parser.add_argument("--nmap-args", nargs="*", default=["-sV", "-Pn"], help="Extra nmap args")
-    parser.add_argument("--nmap-scripts", help="Nmap script selector, e.g. default,vuln")
-    parser.add_argument("--top-ports", type=int, help="Nmap top ports count")
-
-    parser.add_argument(
-        "--dir-enum-args",
-        nargs="*",
-        default=[],
-        help="Extra args for selected directory enumeration backend",
-    )
-    parser.add_argument("--wordlist", help="Wordlist path for dir enum backends")
-
-    parser.add_argument("--json-out", help="Write structured JSON results to this file")
-    parser.add_argument(
-        "--verbose",
-        action="store_true",
-        help="Print full output for each module (default shows compact snippets)",
-    )
-    parser.add_argument(
-        "--failures-only",
-        action="store_true",
-        help="Print output details only for non-zero exit results",
-    )
-
-    args = parser.parse_args(normalize_argv(sys.argv[1:]))
-
+def _compute_enabled_modules(args: argparse.Namespace, available_modules: set[str]) -> set[str]:
+    """Resolve final module set after profile/all/enable/disable flags."""
+    enabled: set[str] = set()
     if args.all:
-        args.whois = args.nslookup = args.dig = args.nmap = args.lynx = args.dir_enum = True
-
+        enabled = set(available_modules)
     if args.profile:
-        apply_profile(args)
-
-    if not any([args.whois, args.nslookup, args.dig, args.nmap, args.lynx, args.dir_enum]):
-        parser.error("No modules selected. Use --all, --profile, or at least one module flag.")
-
-    if args.jobs < 1:
-        parser.error("--jobs must be >= 1")
-
-    return args
-
-
-def run_tasks(args: argparse.Namespace, tasks: Sequence[tuple[str, str, List[str]]]) -> List[ToolResult]:
-    results: List[ToolResult] = []
-
-    with ThreadPoolExecutor(max_workers=args.jobs) as pool:
-        future_map = {}
-        for name, target, cmd in tasks:
-            executable = cmd[0]
-            if executable != "echo" and not command_exists(executable):
-                results.append(
-                    ToolResult(
-                        name=name,
-                        target=target,
-                        command=cmd,
-                        returncode=127,
-                        output=f"'{executable}' not found in PATH.",
-                        duration_seconds=0.0,
-                    )
-                )
-                continue
-
-            future = pool.submit(run_command, name, target, cmd, args.timeout)
-            future_map[future] = (name, target)
-
-        for future in as_completed(future_map):
-            results.append(future.result())
-
-    # Keep a stable readable order: target then module name
-    results.sort(key=lambda r: (r.target, r.name))
-    return results
+        enabled |= _profile_modules(args.profile)
+    enabled |= args.enable_set
+    enabled -= args.disable_set
+    if not enabled:
+        raise ValueError("No modules selected. Use --all, --profile, or --enable.")
+    unknown = enabled - available_modules
+    if unknown:
+        raise ValueError(f"Unknown enabled module(s): {', '.join(sorted(unknown))}")
+    return enabled
 
 
-def write_json_report(args: argparse.Namespace, targets: Sequence[str], results: Sequence[ToolResult]) -> None:
-    if not args.json_out:
-        return
+def _validate_safety(args: argparse.Namespace) -> None:
+    """Validate concurrency and timing safety constraints."""
+    if args.timeout <= 0:
+        raise ValueError("--timeout must be > 0")
+    if args.jobs <= 0:
+        raise ValueError("--jobs must be >= 1")
+    if args.max_jobs <= 0:
+        raise ValueError("--max-jobs must be >= 1")
+    if args.jobs > args.max_jobs:
+        raise ValueError(f"--jobs ({args.jobs}) exceeds --max-jobs ({args.max_jobs})")
+    if args.jobs > SAFE_MAX_JOBS:
+        raise ValueError(f"--jobs exceeds safe hard cap ({SAFE_MAX_JOBS})")
+    if args.rate_limit < 0:
+        raise ValueError("--rate-limit must be >= 0")
+    if args.task_delay < 0:
+        raise ValueError("--task-delay must be >= 0")
 
-    payload = {
-        "generated_at": datetime.now(timezone.utc).isoformat(),
-        "targets": list(targets),
-        "config": {
-            "timeout": args.timeout,
-            "jobs": args.jobs,
-            "profile": args.profile,
-        },
-        "results": [asdict(result) for result in results],
+
+def _print_modules(plugin_map: dict[str, object]) -> None:
+    """Print discovered module names and basic metadata."""
+    print("Discovered modules:")
+    for name in sorted(plugin_map):
+        plugin = plugin_map[name]
+        deps = ", ".join(plugin.required_binaries()) or "(none)"
+        print(f"  - {name:<12} | needs: {deps}")
+
+
+def _print_dry_run(tasks, contexts) -> None:
+    """Print dry-run plan output."""
+    print("[DRY-RUN] Planned targets:")
+    for item in contexts:
+        print(f"  - {item.raw} ({item.target_type}) host={item.host} ip={item.primary_ip or '-'}")
+    print("\n[DRY-RUN] Planned tasks:")
+    for task in tasks:
+        resolved = task.resolved_target or task.target_info.host
+        print(f"  - module={task.module_name:<10} target={task.target_info.raw:<25} resolved={resolved}")
+
+
+def run(argv: Sequence[str]) -> int:
+    """CLI entry point returning process code."""
+    args = parse_args(argv)
+    setup_logging(args.debug)
+    _validate_safety(args)
+
+    LOG.warning("Authorized-use only: run this tool only against approved targets.")
+
+    plugin_map = discover_plugins(PLUGIN_DIRECTORY)
+    if args.list_modules:
+        _print_modules(plugin_map)
+        return 0
+
+    try:
+        targets = _load_targets(args)
+    except Exception as exc:
+        LOG.error("Target loading failed: %s", exc)
+        return 2
+
+    available_modules = set(plugin_map.keys())
+    try:
+        enabled_modules = _compute_enabled_modules(args, available_modules)
+    except Exception as exc:
+        LOG.error("Module selection invalid: %s", exc)
+        return 2
+
+    LOG.info("Enabled modules: %s", ", ".join(sorted(enabled_modules)))
+
+    target_contexts = [analyze_target(target) for target in targets]
+    context = RunContext.from_args(
+        timeout=args.timeout,
+        jobs=args.jobs,
+        max_jobs=args.max_jobs,
+        rate_limit=args.rate_limit,
+        task_delay=args.task_delay,
+        dry_run=args.dry_run,
+        verbose=args.verbose,
+        failures_only=args.failures_only,
+        plugin_args=vars(args),
+    )
+
+    tasks = build_initial_tasks(target_contexts, enabled_modules)
+    if args.dry_run:
+        _print_dry_run(tasks, target_contexts)
+        return 0
+
+    executor = TaskExecutor(plugin_map=plugin_map, context=context)
+    all_results = executor.run_tasks(tasks)
+
+    pipeline_tasks = extend_tasks_from_pipeline(all_results, enabled_modules, target_contexts)
+    if pipeline_tasks:
+        LOG.info("Pipeline generated %d follow-up task(s)", len(pipeline_tasks))
+        all_results.extend(executor.run_tasks(pipeline_tasks))
+
+    config = {
+        "timeout": args.timeout,
+        "jobs": args.jobs,
+        "max_jobs": args.max_jobs,
+        "rate_limit": args.rate_limit,
+        "task_delay": args.task_delay,
+        "profile": args.profile,
+        "enabled_modules": sorted(enabled_modules),
     }
+    payload = build_json_payload(
+        generated_at=context.generated_at,
+        targets=[target.to_dict() for target in target_contexts],
+        config=config,
+        results=all_results,
+    )
+    markdown_report = build_markdown_report(payload)
 
-    output_path = Path(args.json_out)
-    output_path.write_text(json.dumps(payload, indent=2), encoding="utf-8")
-    print(f"\n[+] JSON report written to {output_path}")
+    print_console_summary(all_results, verbose=args.verbose, failures_only=args.failures_only)
+
+    if args.json_out:
+        write_json_report(args.json_out, payload)
+        LOG.info("JSON report written: %s", args.json_out)
+    if args.md_out:
+        write_markdown_report(args.md_out, markdown_report)
+        LOG.info("Markdown report written: %s", args.md_out)
+
+    failed = [result for result in all_results if result.error_type != ErrorType.NONE]
+    if failed:
+        LOG.error("Completed with %d failed module run(s).", len(failed))
+        return 1
+    LOG.info("Completed successfully with %d module run(s).", len(all_results))
+    return 0
 
 
 def main() -> int:
-    args = parse_args()
-
-    print("[!] Authorized-use only: run this tool only against approved targets.")
-
-    try:
-        targets = load_targets(args)
-    except Exception as exc:
-        print(f"[-] Target loading error: {exc}", file=sys.stderr)
-        return 2
-
-    tasks = [task for target in targets for task in build_tasks_for_target(args, target)]
-    results = run_tasks(args, tasks)
-
-    print("\nRecon results:")
-    for result in results:
-        print_result(result)
-
-    print("\nOutput details:")
-    for result in results:
-        if args.failures_only and result.returncode == 0:
-            continue
-        print_result_details(result, verbose=args.verbose)
-
-    write_json_report(args, targets, results)
-
-    failed = [r for r in results if r.returncode != 0]
-    if failed:
-        print(f"\nCompleted with {len(failed)} warning/error module(s) across {len(targets)} target(s).")
-        return 1
-
-    print(f"\nCompleted successfully across {len(targets)} target(s).")
-    return 0
+    """System entry point."""
+    return run(sys.argv[1:])
 
 
 if __name__ == "__main__":
