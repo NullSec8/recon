@@ -1,8 +1,8 @@
 diff --git a/main.py b/main.py
-index 2f9a147db12e882f0e2a73018937fd41ffbad3e5..a764138e6bbc82f2b884deaa89c7d36e225ba905 100644
+index 2f9a147db12e882f0e2a73018937fd41ffbad3e5..2c165b2172b2ca03759c02facb5d5a8851dbfa6b 100644
 --- a/main.py
 +++ b/main.py
-@@ -1 +1,357 @@
+@@ -1 +1,368 @@
 -print("Hello")
 +#!/usr/bin/env python3
 +"""Powerful recon orchestrator for Kali/Linux tools.
@@ -45,6 +45,17 @@ index 2f9a147db12e882f0e2a73018937fd41ffbad3e5..a764138e6bbc82f2b884deaa89c7d36e
 +
 +def command_exists(command: str) -> bool:
 +    return shutil.which(command) is not None
++
++
++def normalize_argv(argv: Sequence[str]) -> List[str]:
++    """Accept common single-dash long options such as `-all` by normalizing to `--all`."""
++    normalized: List[str] = []
++    for arg in argv:
++        if arg.startswith("-") and not arg.startswith("--") and len(arg) > 2 and not arg[1].isdigit():
++            normalized.append(f"--{arg[1:]}")
++        else:
++            normalized.append(arg)
++    return normalized
 +
 +
 +def run_command(name: str, target: str, command: List[str], timeout: int) -> ToolResult:
@@ -256,7 +267,7 @@ index 2f9a147db12e882f0e2a73018937fd41ffbad3e5..a764138e6bbc82f2b884deaa89c7d36e
 +        help="Print output details only for non-zero exit results",
 +    )
 +
-+    args = parser.parse_args()
++    args = parser.parse_args(normalize_argv(sys.argv[1:]))
 +
 +    if args.all:
 +        args.whois = args.nslookup = args.dig = args.nmap = args.lynx = args.dir_enum = True
