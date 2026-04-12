@@ -19,6 +19,7 @@ import json
 import shutil
 import subprocess
 import sys
+import textwrap
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import asdict, dataclass
 from datetime import datetime, timezone
@@ -85,12 +86,24 @@ def run_command(name: str, target: str, command: List[str], timeout: int) -> Too
 def print_result(result: ToolResult) -> None:
     status = "OK" if result.returncode == 0 else f"EXIT {result.returncode}"
     cmd = " ".join(result.command)
-    print(
-        f"\n{'=' * 100}\n"
-        f"[{result.target}] [{result.name}] {status} ({result.duration_seconds:.2f}s)\n"
-        f"$ {cmd}\n{'-' * 100}"
-    )
-    print(result.output)
+    print(f"  - [{result.target}] {result.name:<12} {status:<9} {result.duration_seconds:>6.2f}s | {cmd}")
+
+
+def format_output_snippet(output: str, max_lines: int = 12, max_width: int = 120) -> str:
+    lines = output.splitlines()
+    clipped = lines[:max_lines]
+    if len(lines) > max_lines:
+        clipped.append(f"... ({len(lines) - max_lines} more lines)")
+    cleaned = [textwrap.shorten(line, width=max_width, placeholder=" ...") for line in clipped]
+    return "\n".join(cleaned) if cleaned else "(no output)"
+
+
+def print_result_details(result: ToolResult, verbose: bool) -> None:
+    print(f"\n[{result.target}] {result.name} output:")
+    if verbose:
+        print(result.output)
+    else:
+        print(format_output_snippet(result.output))
 
 
 def pick_dir_enum_command(args: argparse.Namespace, target: str) -> tuple[str, List[str]]:
@@ -226,6 +239,16 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--wordlist", help="Wordlist path for dir enum backends")
 
     parser.add_argument("--json-out", help="Write structured JSON results to this file")
+    parser.add_argument(
+        "--verbose",
+        action="store_true",
+        help="Print full output for each module (default shows compact snippets)",
+    )
+    parser.add_argument(
+        "--failures-only",
+        action="store_true",
+        help="Print output details only for non-zero exit results",
+    )
 
     args = parser.parse_args()
 
@@ -309,8 +332,15 @@ def main() -> int:
     tasks = [task for target in targets for task in build_tasks_for_target(args, target)]
     results = run_tasks(args, tasks)
 
+    print("\nRecon results:")
     for result in results:
         print_result(result)
+
+    print("\nOutput details:")
+    for result in results:
+        if args.failures_only and result.returncode == 0:
+            continue
+        print_result_details(result, verbose=args.verbose)
 
     write_json_report(args, targets, results)
 
