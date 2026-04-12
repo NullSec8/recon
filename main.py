@@ -212,7 +212,10 @@ def apply_profile(args: argparse.Namespace) -> None:
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="Powerful Kali/Linux recon helper. Run one or many recon modules across targets."
+        description=(
+            "Powerful Kali/Linux recon helper. Run one or many recon modules across targets. "
+            "Example: python3 main.py -all example.com"
+        )
     )
     parser.add_argument("target", nargs="?", help="Domain/IP target (example.com or 10.10.10.10)")
     parser.add_argument("--targets-file", help="File with targets, one per line")
@@ -229,7 +232,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--nmap", action="store_true", help="Run nmap")
     parser.add_argument("--lynx", action="store_true", help="Run lynx -dump")
     parser.add_argument("--dir-enum", action="store_true", help="Run directory enumeration module")
-    parser.add_argument("--all", action="store_true", help="Enable all modules")
+    parser.add_argument("--all", "-all", action="store_true", help="Enable all modules")
 
     parser.add_argument(
         "--profile",
