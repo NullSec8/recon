@@ -82,7 +82,7 @@ def run_command(name: str, target: str, command: List[str], timeout: int) -> Too
             output=f"Command timed out after {timeout}s",
             duration_seconds=(end - start).total_seconds(),
         )
-    except Exception as exc:  # defensive fallback
+    except Exception as exc:
         end = datetime.now(timezone.utc)
         return ToolResult(
             name=name,
@@ -212,7 +212,10 @@ def apply_profile(args: argparse.Namespace) -> None:
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="Powerful Kali/Linux recon helper. Run one or many recon modules across targets."
+        description=(
+            "Powerful Kali/Linux recon helper. Run one or many recon modules across targets. "
+            "Example: python3 main.py --all example.com"
+        )
     )
     parser.add_argument("target", nargs="?", help="Domain/IP target (example.com or 10.10.10.10)")
     parser.add_argument("--targets-file", help="File with targets, one per line")
@@ -229,7 +232,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--nmap", action="store_true", help="Run nmap")
     parser.add_argument("--lynx", action="store_true", help="Run lynx -dump")
     parser.add_argument("--dir-enum", action="store_true", help="Run directory enumeration module")
-    parser.add_argument("--all", action="store_true", help="Enable all modules")
+
+    parser.add_argument("--all", "-all", action="store_true", help="Enable all modules")
 
     parser.add_argument(
         "--profile",
@@ -304,7 +308,6 @@ def run_tasks(args: argparse.Namespace, tasks: Sequence[tuple[str, str, List[str
         for future in as_completed(future_map):
             results.append(future.result())
 
-    # Keep a stable readable order: target then module name
     results.sort(key=lambda r: (r.target, r.name))
     return results
 
