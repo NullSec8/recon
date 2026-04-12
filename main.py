@@ -41,6 +41,17 @@ def command_exists(command: str) -> bool:
     return shutil.which(command) is not None
 
 
+def normalize_argv(argv: Sequence[str]) -> List[str]:
+    """Accept common single-dash long options such as `-all` by normalizing to `--all`."""
+    normalized: List[str] = []
+    for arg in argv:
+        if arg.startswith("-") and not arg.startswith("--") and len(arg) > 2 and not arg[1].isdigit():
+            normalized.append(f"--{arg[1:]}")
+        else:
+            normalized.append(arg)
+    return normalized
+
+
 def run_command(name: str, target: str, command: List[str], timeout: int) -> ToolResult:
     start = datetime.now(timezone.utc)
     try:
@@ -250,7 +261,7 @@ def parse_args() -> argparse.Namespace:
         help="Print output details only for non-zero exit results",
     )
 
-    args = parser.parse_args()
+    args = parser.parse_args(normalize_argv(sys.argv[1:]))
 
     if args.all:
         args.whois = args.nslookup = args.dig = args.nmap = args.lynx = args.dir_enum = True
